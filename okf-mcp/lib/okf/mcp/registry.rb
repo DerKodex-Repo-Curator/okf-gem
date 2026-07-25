@@ -40,7 +40,14 @@ module OKF
           end
           raise Error, "no bundle roots given" if roots.empty?
 
-          new(mint_entries(roots, ref_slugs), kernel: kernel, source: kernel&.path, notes: notes)
+          # The kernel registry is deliberately **not** carried into the
+          # instance. It answered the @refs above, at boot, where the operator
+          # asked for them — keeping it would leave a request-time door into
+          # every bundle argv did not name: a group slug passed to `search`
+          # expanded through it and returned content from bundles outside the
+          # allowlist. Argv names the served set; groups are a registry-mode
+          # identity, and in argv mode they already fanned out to their leaves.
+          new(mint_entries(roots, ref_slugs), source: kernel&.path, notes: notes)
         end
 
         # Boot from the active kernel registry — the no-argv default.
@@ -191,7 +198,12 @@ module OKF
       # [ slug, root ], skipped naming the bundles "*"/a group forgave (their
       # directory is gone); a *named* slug whose directory is gone raises.
       def resolve_search(asked)
-        names = Array(asked.nil? || asked == "" ? "*" : asked)
+        # An *empty list* is an argument mistake, not a fact about the disk. It
+        # used to fall through to the "missing on disk" branch below, sending
+        # the reader off diagnosing a broken installation.
+        raise Error, "bundles: [] names no bundle — omit it (or pass \"*\") to search every bundle" if asked.is_a?(Array) && asked.empty?
+
+        names = Array(OKF.blank?(asked) ? "*" : asked)
         pairs = []
         skipped = []
         names.each do |name|

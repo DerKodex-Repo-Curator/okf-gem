@@ -33,6 +33,14 @@ stateless JSON mode for every agent at once. The boot line goes to stderr and
 names the backend, the served bundles, and the registry file the slugs came
 from.
 
+Binding beyond loopback keeps the SDK's DNS-rebinding protection on: a wildcard
+`--bind 0.0.0.0` admits this machine's own addresses and hostname, and
+`--allow-host HOST` (repeatable) adds a name only a proxy or DNS knows.
+
+Whatever argv names is the whole served set. A registry ref is resolved once, at
+boot; no tool argument can widen the set afterwards, so a group slug reaches
+bundles only when the registry itself is what is being served.
+
 ## Host configuration
 
 Claude Desktop (`claude_desktop_config.json`):

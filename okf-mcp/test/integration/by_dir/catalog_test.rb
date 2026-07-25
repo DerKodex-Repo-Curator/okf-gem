@@ -54,6 +54,24 @@ module ByDir
       data["concepts"].each { |row| assert_equal %w[id type], row.keys }
     end
 
+    # The bundle root has four spellings and they must all mean the same
+    # thing — and the same thing the other tools mean by them.
+    test "\"/\", \".\" and \"root\" all name the bundle root" do
+      server = mcp_server(fixture("notes"))
+      direct = call_tool!(server, "catalog", bundle: "notes", dir: ".")["total"]
+      assert_equal 2, direct
+
+      assert_equal direct, call_tool!(server, "catalog", bundle: "notes", dir: "/")["total"]
+      assert_equal direct, call_tool!(server, "catalog", bundle: "notes", dir: "root")["total"]
+    end
+
+    test "surfaces unparseable files rather than answering as if whole" do
+      server = mcp_server(fixture("scrappy"))
+      data = call_tool!(server, "catalog", bundle: "scrappy")
+      assert_equal 1, data["total"]
+      assert_equal 1, data["unparseable"]
+    end
+
     test "an unknown field is a tool error naming the row keys" do
       server = mcp_server(fixture("knowledge"))
       result = call_tool(server, "catalog", bundle: "knowledge", fields: [ "body" ])

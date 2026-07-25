@@ -40,6 +40,30 @@ module ByDir
       assert_match(/no directory "no-such" in bundle "knowledge"/, result.text)
     end
 
+    # The dir vocabulary must read the same to every tool: catalog has always
+    # matched a directory case-insensitively, so the orientation tools cannot
+    # answer "no such directory" for a name catalog happily resolves.
+    test "a dir is matched case-insensitively, as catalog matches it" do
+      server = mcp_server(fixture("knowledge"))
+      data = call_tool!(server, "dirs", bundle: "knowledge", dir: "Services")
+      assert_equal [ "services" ], data["dirs"].map { |row| row["dir"] }
+    end
+
+    test "\"/\" names the bundle root, as it does everywhere else" do
+      server = mcp_server(fixture("knowledge"))
+      data = call_tool!(server, "dirs", bundle: "knowledge", dir: "/")
+      assert_includes data["dirs"].map { |row| row["dir"] }, "."
+    end
+
+    # An unrecognized argument must come back as something the model can read
+    # and retry, never as a protocol-level -32603 with no message.
+    test "an unknown argument is an actionable tool error, not a protocol error" do
+      server = mcp_server(fixture("knowledge"))
+      result = call_tool(server, "dirs", bundle: "knowledge", sort: "title")
+      assert result.error?
+      assert_match(/sort/, result.text)
+    end
+
     test "an unknown bundle is a tool error listing the known slugs" do
       server = mcp_server(fixture("knowledge"), fixture("notes"))
       result = call_tool(server, "dirs", bundle: "nope")

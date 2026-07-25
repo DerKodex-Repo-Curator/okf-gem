@@ -42,6 +42,12 @@ module ByDir
       assert services.key?("out")
     end
 
+    test "surfaces unparseable files rather than answering as if whole" do
+      server = mcp_server(fixture("scrappy"))
+      data = call_tool!(server, "graph", bundle: "scrappy")
+      assert_equal 1, data["unparseable"]
+    end
+
     test "an unknown view is refused by the schema, naming the three on offer" do
       server = mcp_server(fixture("knowledge"))
       result = call_tool(server, "graph", bundle: "knowledge", view: "everything")

@@ -85,6 +85,43 @@ module AcrossBundles
       end
     end
 
+    # The containment rule: argv names the served set, and nothing reached
+    # through a *request* may widen it. A group is a registry identity, and in
+    # argv mode it fanned out at boot — so at query time a group slug names
+    # nothing served, and must not be a second door into the kernel registry.
+    # `@knowledge` is what makes this bite: resolving a ref loads the kernel
+    # registry at boot, and holding on to it gave a *request* a second door
+    # into every bundle the operator did not serve.
+    test "argv mode: a group slug cannot reach a bundle that was never served" do
+      with_registry("knowledge", "notes") do |registry|
+        registry.set_group("docs", %w[knowledge notes])
+        server = mcp_server("@knowledge") # only knowledge is served
+
+        result = call_tool(server, "search", terms: [ "invoices" ], bundles: "docs")
+        assert result.error?, "a group slug expanded past the argv allowlist"
+        refute_match(/notes/, result.text)
+      end
+    end
+
+    test "argv mode: list_bundles advertises no group it cannot serve" do
+      with_registry("knowledge", "notes") do |registry|
+        registry.set_group("docs", %w[knowledge notes])
+        data = call_tool!(mcp_server("@knowledge"), "list_bundles")
+
+        assert_equal [ "knowledge" ], data["bundles"].map { |row| row["slug"] }
+        refute data.key?("groups"), "argv mode advertised a group naming an unserved bundle"
+      end
+    end
+
+    # The empty list is an argument mistake, and blaming the disk for it sends
+    # the agent off diagnosing a broken installation.
+    test "an empty bundles list names the argument, never the disk" do
+      server = mcp_server(fixture("knowledge"), fixture("notes"))
+      result = call_tool(server, "search", terms: [ "billing" ], bundles: [])
+      assert result.error?
+      refute_match(/missing on disk/, result.text)
+    end
+
     test "an unknown name among several is a tool error, not a partial answer" do
       server = mcp_server(fixture("knowledge"), fixture("notes"))
       result = call_tool(server, "search", terms: [ "x" ], bundles: %w[knowledge nope])

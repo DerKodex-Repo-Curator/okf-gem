@@ -28,6 +28,7 @@ module OKF
         @http = false
         @bind = DEFAULT_BIND
         @port = DEFAULT_PORT
+        @allow_hosts = []
         @done = false
       end
 
@@ -56,6 +57,8 @@ module OKF
           opts.on("--http", "serve Streamable HTTP instead of stdio") { @http = true }
           opts.on("--bind HOST", "HTTP bind address (default #{DEFAULT_BIND})") { |value| @bind = value }
           opts.on("--port PORT", Integer, "HTTP port (default #{DEFAULT_PORT})") { |value| @port = value }
+          opts.on("--allow-host HOST", "admit this Host header (repeatable; for a DNS name",
+            "or a reverse proxy no local interface knows about)") { |value| @allow_hosts << value }
           opts.on("-h", "--help", "print this help") do
             $stdout.puts(opts)
             @done = true
@@ -84,7 +87,7 @@ module OKF
 
       def serve_http(server)
         require_relative "http"
-        HTTP.serve(server, bind: @bind, port: @port, out: @out)
+        HTTP.serve(server, bind: @bind, port: @port, allow_hosts: @allow_hosts, out: @out)
       end
     end
   end

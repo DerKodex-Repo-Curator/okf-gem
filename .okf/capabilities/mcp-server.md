@@ -34,6 +34,18 @@ refused by every single-bundle tool (the second-bundle rule by another
 spelling); `"*"` tolerates a vanished directory and names the skip in the
 payload, while naming one bundle demands it exist.
 
+**The allowlist is closed at boot, and that is a property of the object, not a
+promise in a comment.** Resolving an `@ref` consults the kernel registry — and
+the first version then *kept* it, which quietly made a request-time door out of
+a boot-time convenience: a group slug handed to `search` expanded through the
+retained registry and returned bodies from bundles the operator had
+deliberately not served. The fix is structural rather than a check: argv mode
+does not carry the registry into the instance at all, so there is nothing to
+expand through. Groups are a registry-mode identity, and in argv mode they have
+already fanned out to their leaves by the time any tool runs. The general
+shape, worth carrying to the next surface: **a capability held "just to answer
+questions" is reachable by anything that can ask one.**
+
 # The long-lived holder's branch
 
 The [search](search.md) capability's lifecycle asymmetry, honored from the

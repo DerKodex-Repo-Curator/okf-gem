@@ -135,6 +135,39 @@ module ByDir
       assert_empty data["results"]
     end
 
+    # Nine of the ten tools take `bundle`; only this one takes `bundles`. The
+    # near-miss must not widen the answer to every bundle in silence.
+    test "a stray singular bundle: is refused, never widened to every bundle" do
+      server = mcp_server(fixture("knowledge"), fixture("notes"))
+      result = call_tool(server, "search", bundle: "knowledge", terms: [ "invoices" ])
+      assert result.error?
+      assert_match(/bundle/, result.text)
+    end
+
+    # An MCP client filling every declared optional property with an empty
+    # default is routine; an empty filter must mean "no filter", as it does in
+    # catalog, not "match nothing".
+    test "empty-string filters are no filter, matching catalog" do
+      server = mcp_server(fixture("knowledge"))
+      unfiltered = call_tool!(server, "search", terms: [ "billing" ], bundles: "knowledge")["total"]
+
+      assert_equal unfiltered, call_tool!(server, "search", terms: [ "billing" ], bundles: "knowledge", type: "")["total"]
+      assert_equal unfiltered, call_tool!(server, "search", terms: [ "billing" ], bundles: "knowledge", tag: "")["total"]
+      assert_equal unfiltered, call_tool!(server, "search", terms: [ "billing" ], bundles: "knowledge", dir: "")["total"]
+    end
+
+    test "a dir filter is case-insensitive, as catalog's is" do
+      server = mcp_server(fixture("knowledge"))
+      data = call_tool!(server, "search", terms: [ "billing" ], bundles: "knowledge", dir: "Services")
+      assert_equal [ "services/billing" ], data["results"].map { |row| row["id"] }
+    end
+
+    test "the head surfaces unparseable files rather than answering as if whole" do
+      server = mcp_server(fixture("scrappy"))
+      data = call_tool!(server, "search", terms: [ "fine" ])
+      assert_equal 1, data["bundles"].first["unparseable"]
+    end
+
     private
 
     # The okf-sqlite3 seam without okf-sqlite3: an engine that answers the

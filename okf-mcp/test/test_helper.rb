@@ -24,6 +24,7 @@ $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 require "okf/mcp"
 
 require "minitest/autorun"
+require "minitest/mock"
 require "tmpdir"
 require "fileutils"
 

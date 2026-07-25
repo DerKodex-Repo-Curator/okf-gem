@@ -56,6 +56,23 @@ module ByDir
       assert_match(/invalid stale_after "soonish"/, result.text)
     end
 
+    # The folder lens *is* the unlinked check, so the check-selection and
+    # threshold options have nothing to act on. Silently ignoring them let a
+    # caller read the full listing as though its filter had been applied.
+    test "group folder refuses the options it cannot honour" do
+      server = mcp_server(fixture("knowledge"))
+      %i[only except min_body stale_after].each do |option|
+        value = case option
+                when :only, :except then [ "stale" ]
+                when :min_body then 100
+                else "90d"
+                end
+        result = call_tool(server, "lint", bundle: "knowledge", group: "folder", option => value)
+        assert result.error?, "lint(group: \"folder\", #{option}: …) answered as if the option applied"
+        assert_match(/folder/, result.text)
+      end
+    end
+
     test "group folder answers with the unlinked files by folder" do
       server = mcp_server(fixture("knowledge"))
       data = call_tool!(server, "lint", bundle: "knowledge", group: "folder")

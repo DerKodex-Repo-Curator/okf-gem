@@ -221,7 +221,7 @@ module OKF
                   description: "One or more search terms; a concept must match all of them."
                 },
                 bundles: {
-                  type: %w[string array], items: { type: "string" },
+                  type: %w[string array], items: { type: "string" }, minItems: 1,
                   description: "A bundle slug, an array of slugs, a group slug, or \"*\" for every bundle (the default)."
                 },
                 engine: { type: "string", enum: %w[scan index], description: "Match with this engine (default scan: raw text, exact)." },
@@ -294,7 +294,8 @@ module OKF
             rows = context.engine.catalog(root, { type: type, dir: dir, tag: tag, status: status })
             sliced = rows[offset, limit] || []
             sliced = sliced.map { |row| row.select { |key, _| projection.include?(key.to_s) } } if projection
-            respond_json(bundle: slug_of(context, bundle), total: rows.length, concepts: sliced)
+            respond_json(with_unparseable(context.memory.folder(root),
+              bundle: slug_of(context, bundle), total: rows.length, concepts: sliced))
           end
         end
 
@@ -405,7 +406,10 @@ module OKF
 
           payload = {
             query: Array(terms),
-            bundles: pairs.map { |slug, root| { slug: slug, dir: root } },
+            # §9 best-effort, surfaced per bundle: a corpus built from a folder
+            # that skipped unusable files must say so, or a term living only in
+            # an unreadable file reads back as "this bundle does not mention it".
+            bundles: pairs.map { |slug, root| bundle_head_row(context, slug, root) },
             total: rows.length,
             results: rows.first(limit).map { |row| search_row(row, pairs) }
           }
@@ -447,11 +451,16 @@ module OKF
           end
         end
 
+        # `OKF.blank?`, not `.nil?`: an empty string is truthy in Ruby, so an
+        # MCP client that fills every declared optional property with an empty
+        # default (routine model behaviour) was handing `search` a filter that
+        # matched nothing — while `catalog`, one tool over, read the same ""
+        # as "no filter" and answered for the whole bundle.
         def filter_rows(rows, options)
           rows.select do |row|
-            (options[:type].nil? || fold(row[:type]) == fold(options[:type])) &&
-              (options[:dir].nil? || under_dir?(row[:dir], options[:dir])) &&
-              (options[:tag].nil? || Array(row[:tags]).any? { |tag| fold(tag) == fold(options[:tag]) })
+            (OKF.blank?(options[:type]) || Filters.fold(row[:type]) == Filters.fold(options[:type])) &&
+              (OKF.blank?(options[:dir]) || Filters.under_dir?(row[:dir], options[:dir])) &&
+              (OKF.blank?(options[:tag]) || Array(row[:tags]).any? { |tag| Filters.fold(tag) == Filters.fold(options[:tag]) })
           end
         end
 
@@ -473,7 +482,21 @@ module OKF
 
         def lint_call(context, bundle, min_body, stale_after, only, except, group)
           folder = context.folder(bundle)
-          return respond_json(loose_payload(context, bundle, folder)) if group == "folder"
+          if group == "folder"
+            # The folder lens *is* the unlinked check, so the check-selection
+            # and threshold options have nothing to act on. Returning here
+            # while silently dropping them let a caller read the full listing
+            # as though its filter had been applied — and skipped the check-id
+            # vocabulary check, so a typo'd id passed here and errored there.
+            offered = { only: only, except: except, min_body: min_body, stale_after: stale_after }
+            given = offered.reject { |_, value| OKF.blank?(value) }.keys
+            unless given.empty?
+              raise Error, "group \"folder\" is the unlinked lens and takes no #{given.join("/")} — " \
+                           "drop #{given.length == 1 ? "it" : "them"}, or drop `group` to run the checks"
+            end
+
+            return respond_json(with_unparseable(folder, loose_payload(context, bundle, folder)))
+          end
 
           checks = { only: only, except: except }.each_with_object({}) do |(key, list), out|
             next if OKF.blank?(list)
@@ -508,9 +531,16 @@ module OKF
           { bundle: slug_of(context, bundle), group: "folder", total: files.length, files: files }
         end
 
+        # One searched bundle in the payload head: slug → dir once, plus the
+        # count of files the reader could not parse when there are any.
+        def bundle_head_row(context, slug, root)
+          row = { slug: slug, dir: root }
+          with_unparseable(context.memory.folder(root), row)
+        end
+
         def graph_call(context, bundle, view)
           folder = context.folder(bundle)
-          payload = { bundle: slug_of(context, bundle), view: view }
+          payload = with_unparseable(folder, bundle: slug_of(context, bundle), view: view)
           case view
           when "minimal"
             graph = folder.graph(minimal: true)
@@ -555,7 +585,15 @@ module OKF
           ::MCP::Tool.define(
             name: name,
             description: description,
-            input_schema: input_schema,
+            # `additionalProperties: false` is the first line of the same
+            # defence as the rescue below. Without it an unrecognized argument
+            # reached `body.call(**arguments)` and raised ArgumentError, which
+            # escaped as a bare JSON-RPC -32603 the model could not read or
+            # act on — and `search`, which takes **options, silently *absorbed*
+            # a near-miss like the singular `bundle:` and widened its answer to
+            # every bundle. The SDK validates the full 2020-12 vocabulary, so
+            # the unknown key is now named back to the caller.
+            input_schema: input_schema.merge(additionalProperties: false),
             annotations: { read_only_hint: true, destructive_hint: false, open_world_hint: false }
           ) do |**arguments|
             arguments.delete(:server_context)
@@ -563,6 +601,10 @@ module OKF
               body.call(**arguments)
             rescue Error, OKF::Error, SystemCallError => e
               Server.send(:respond_error, e.message)
+            rescue ArgumentError => e
+              # Belt to the schema's braces: a host that disables argument
+              # validation still gets an actionable tool error, never -32603.
+              Server.send(:respond_error, "#{e.message} (tool #{name})")
             end
           end
         end
@@ -607,31 +649,23 @@ module OKF
           payload
         end
 
-        # The directory rows at most +depth+ levels below +dir+ (nil or "." or
-        # "root": the bundle root, which is the ancestor of everything).
+        # The directory rows at most +depth+ levels below +dir+ (nil, "", ".",
+        # "/" or "root": the bundle root, which is the ancestor of everything).
+        # Comparison folds case, because every other dir filter in this file
+        # does — `dirs(dir: "Services")` used to answer "no such directory" for
+        # a name `catalog` resolved without complaint.
         def scoped_rows(entries, dir, depth, bundle)
-          base = normalize_dir(dir)
+          base = Filters.normalize_dir(dir)
           unless base == "."
-            known = entries.any? { |entry| entry[:dir] == base }
+            known = entries.any? { |entry| Filters.fold(entry[:dir]) == base }
             raise Error, "no directory #{dir.inspect} in bundle #{bundle.inspect}" unless known
           end
-          base_depth = dir_depth(base)
+          base_depth = Filters.dir_depth(base)
           entries.select do |entry|
-            next false unless base == "." || entry[:dir] == base || entry[:dir].start_with?("#{base}/")
+            next false unless Filters.within?(entry[:dir], base)
 
-            depth.nil? || (dir_depth(entry[:dir]) - base_depth) <= depth
+            depth.nil? || (Filters.dir_depth(Filters.fold(entry[:dir])) - base_depth) <= depth
           end
-        end
-
-        def normalize_dir(dir)
-          value = dir.to_s.sub(/\/+\z/, "")
-          return "." if value.empty? || value == "." || value.downcase == "root"
-
-          value
-        end
-
-        def dir_depth(dir)
-          dir == "." ? 0 : dir.split("/").length
         end
 
         # Per dir, the concepts at or below it — defined as exactly what
@@ -645,22 +679,6 @@ module OKF
               same || entry[:dir] == "." ? sum + other[:count] : sum
             end ]
           end
-        end
-
-        # The CLI's one rule for concept `dir` filters, kept verbatim: a dir
-        # names itself and everything beneath it, and "." — a prefix of
-        # nothing — selects only what lives directly in the root. (The *tree*
-        # scoping in #scoped_rows is the different case: there the root is the
-        # ancestor of every row.)
-        def under_dir?(entry_dir, wanted)
-          entry = fold(entry_dir)
-          path = fold(wanted).sub(/\/+\z/, "")
-          path = "." if path == "root" || path.empty?
-          entry == path || entry.start_with?("#{path}/")
-        end
-
-        def fold(value)
-          value.to_s.downcase
         end
 
         # A fields ask validated against the vocabulary it selects from; nil

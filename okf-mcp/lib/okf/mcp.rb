@@ -3,6 +3,7 @@
 require "okf"
 
 require_relative "mcp/version"
+require_relative "mcp/filters"
 require_relative "mcp/registry"
 require_relative "mcp/memory_backend"
 require_relative "mcp/backend"

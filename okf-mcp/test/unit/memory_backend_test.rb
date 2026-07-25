@@ -54,6 +54,64 @@ class MemoryBackendTest < OKF::TestCase
     assert_equal 1, fuzzy.length
   end
 
+  # The fingerprint's promise is that results reflect the current files. A
+  # second write inside one filesystem timestamp tick (1 s on HFS+, NFS and
+  # Docker bind mounts) leaves the file list and the newest mtime unmoved, so
+  # the length of the content is the cheap signal that catches it. No utime
+  # here on purpose — that workaround is what hid this from the suite.
+  test "a same-timestamp edit that changes the content is seen" do
+    first = @backend.folder(@dir)
+    mtime = File.mtime(File.join(@dir, "note.md"))
+
+    path = File.join(@dir, "note.md")
+    File.write(path, "---\ntype: Note\ntitle: One\n---\n\nA rewritten body, of a different length entirely.\n")
+    File.utime(mtime, mtime, path) # the coarse-granularity filesystem, simulated exactly
+
+    refute_same first, @backend.folder(@dir)
+    assert_match(/rewritten body/, @backend.folder(@dir).bundle.concepts.first.body)
+  end
+
+  # The kernel's Reader rescues SystemCallError per file so one vanished file
+  # never breaks a read; the cache check must not reintroduce that failure.
+  # Stubbing the glob is what makes the race deterministic — the real one (a
+  # `git checkout` mid-call) cannot be timed from a test.
+  test "a path that vanished between the glob and the stat does not raise" do
+    ghost = File.join(@dir, "ghost.md")
+    Dir.stub(:glob, [ File.join(@dir, "note.md"), ghost ]) do
+      assert_kind_of Array, @backend.send(:fingerprint, @dir)
+    end
+  end
+
+  test "the corpus cache is bounded rather than growing per bundle subset" do
+    roots = Array.new(OKF::MCP::MemoryBackend::MAX_CORPORA + 2) do |i|
+      dir = Dir.mktmpdir("okf-mcp-corpus-#{i}")
+      File.write(File.join(dir, "note.md"), "---\ntype: Note\ntitle: N#{i}\n---\n\nBody #{i}.\n")
+      dir
+    end
+    begin
+      roots.each_with_index { |root, i| @backend.search_pairs([ [ "b#{i}", root ] ], [ "body" ], engine: "index") }
+      held = @backend.instance_variable_get(:@corpora).size
+      assert_operator held, :<=, OKF::MCP::MemoryBackend::MAX_CORPORA
+    ensure
+      roots.each { |root| FileUtils.rm_rf(root) }
+    end
+  end
+
+  test "a reordered bundle list reuses the held corpus rather than rebuilding" do
+    other = Dir.mktmpdir("okf-mcp-other")
+    File.write(File.join(other, "note.md"), "---\ntype: Note\ntitle: Other\n---\n\nAnother body.\n")
+    begin
+      forward = [ [ "a", @dir ], [ "b", other ] ]
+      backward = [ [ "b", other ], [ "a", @dir ] ]
+      @backend.search_pairs(forward, [ "body" ], engine: "index")
+      @backend.search_pairs(backward, [ "body" ], engine: "index")
+
+      assert_equal 1, @backend.instance_variable_get(:@corpora).size
+    ensure
+      FileUtils.rm_rf(other)
+    end
+  end
+
   test "catalog filters by type, tag, dir prefix and status" do
     FileUtils.mkdir_p(File.join(@dir, "deep"))
     File.write(File.join(@dir, "deep", "two.md"),

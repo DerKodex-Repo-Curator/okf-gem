@@ -12,6 +12,14 @@ module OKF
     class MemoryBackend
       FILTER_KEYS = %i[type tag dir status].freeze
 
+      # How many prepared corpora to hold at once, most-recently-used first.
+      # It used to be unbounded, keyed on the queried subset — a long-lived
+      # --http process answering `bundles: ["a","b"]`, then ["a","c"], then
+      # ["b","c","d"] retained a full index for each of up to 2^n subsets until
+      # the box swapped. Four covers the real pattern ("*" plus a couple of
+      # working sets) and bounds the worst case at four indexes.
+      MAX_CORPORA = 4
+
       def initialize
         @mutex = Mutex.new
         @cache = {}
@@ -87,16 +95,21 @@ module OKF
       # One corpus per served set, keyed by its roots and pinned to the exact
       # folder objects it was built from. #folder returns a new object only
       # when a fingerprint moved, so identity comparison is the staleness check.
+      #
+      # Both the key and the pinned folders are sorted, so `["a","b"]` and
+      # `["b","a"]` are the same entry rather than two that evict each other on
+      # every alternation. The cache is an LRU bounded at MAX_CORPORA: re-inserting
+      # on a hit moves the entry to the end, and the oldest is dropped past the cap.
       def corpus_for(pairs)
-        folders = pairs.map { |slug, root| [ slug, folder(root) ] }
-        key = pairs.map { |_, root| root }.sort
+        sorted = pairs.sort_by { |slug, root| [ root, slug.to_s ] }
+        folders = sorted.map { |slug, root| [ slug, folder(root) ] }
+        key = sorted.map { |_, root| root }
         @corpus_mutex.synchronize do
-          held = @corpora[key]
-          unless held && held[:folders] == folders
-            corpus = Bundle::Search.prepare(folders.map { |slug, f| [ slug, f.bundle ] }, engine: "index")
-            held = { corpus: corpus, folders: folders }
-            @corpora[key] = held
-          end
+          held = @corpora.delete(key)
+          held = nil unless held && held[:folders] == folders
+          held ||= { corpus: Bundle::Search.prepare(folders.map { |slug, f| [ slug, f.bundle ] }, engine: "index"), folders: folders }
+          @corpora[key] = held
+          @corpora.shift while @corpora.size > MAX_CORPORA
           held[:corpus]
         end
       end
@@ -107,30 +120,39 @@ module OKF
           next true if OKF.blank?(wanted)
 
           case key
-          when :tag then Array(row[:tags]).map { |tag| fold(tag) }.include?(fold(wanted))
-          when :dir then under_dir?(row[:dir], wanted)
-          else fold(row[key]) == fold(wanted)
+          when :tag then Array(row[:tags]).map { |tag| Filters.fold(tag) }.include?(Filters.fold(wanted))
+          when :dir then Filters.under_dir?(row[:dir], wanted)
+          else Filters.fold(row[key]) == Filters.fold(wanted)
           end
         end
       end
 
-      # The CLI's one rule for --dir, kept verbatim: a dir names itself and
-      # everything beneath it, and "." selects only the root.
-      def under_dir?(entry_dir, wanted)
-        entry = fold(entry_dir)
-        path = fold(wanted).sub(/\/+\z/, "")
-        path = "." if path == "root"
-        entry == path || entry.start_with?("#{path}/")
-      end
-
-      def fold(value)
-        value.to_s.downcase
-      end
-
+      # What the residency cache watches: every markdown file with its mtime
+      # **and its size**.
+      #
+      # The size is what makes a same-second edit visible. mtime alone has
+      # 1-second granularity on HFS+, NFS and Docker bind mounts, so a second
+      # save inside one tick left the file list and the newest mtime unmoved
+      # and the bundle was never re-read — against the server's own promise
+      # that results reflect the current files. A same-second edit that also
+      # preserves the byte count is still invisible; catching that needs a
+      # content hash on every call, which is the whole cost this cache exists
+      # to avoid.
+      #
+      # `stat` is rescued per path because the glob is a moment old by the time
+      # it is walked: a `git checkout` or `rm` mid-call would otherwise raise
+      # ENOENT and answer the tool with an errno instead of results. A file
+      # that vanished simply drops out — which changes the fingerprint, which
+      # is exactly the reload the disappearance should trigger.
       def fingerprint(root)
-        paths = Dir.glob(::File.join(root, "**", "*.md")).sort
-        newest = paths.map { |path| ::File.mtime(path).to_f }.max
-        [ paths, newest ]
+        Dir.glob(::File.join(root, "**", "*.md")).sort.map do |path|
+          stat = begin
+            ::File.stat(path)
+          rescue SystemCallError
+            next nil
+          end
+          [ path, stat.mtime.to_f, stat.size ]
+        end.compact
       end
     end
   end

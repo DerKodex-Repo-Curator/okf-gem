@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "socket"
 require "stringio"
 require "webrick"
 
@@ -21,8 +22,16 @@ module OKF
       # allowlist — its DNS-rebinding protection accepts these out of the box.
       LOOPBACK_HOSTS = %w[127.0.0.1 ::1 localhost].freeze
 
-      def serve(server, bind:, port:, out: $stderr)
-        app = app_for(server, bind: bind)
+      # Binds that mean "every interface" rather than one address.
+      WILDCARD_BINDS = %w[0.0.0.0 :: *].freeze
+
+      # The largest request body the bridge will hand the transport, matching
+      # the SDK's own StreamableHTTPTransport default. Anything past it is 413
+      # before it is allocated (see #read_body).
+      MAX_REQUEST_BYTES = 4 * 1024 * 1024
+
+      def serve(server, bind:, port:, allow_hosts: [], out: $stderr)
+        app = app_for(server, bind: bind, allowed_hosts: allowed_hosts_for(bind, extra: allow_hosts))
         httpd = build(app, bind: bind, port: port)
         %w[INT TERM].each { |signal| trap(signal) { httpd.shutdown } }
         # The listener's own port, not the asked-for one: with --port 0 the OS
@@ -37,20 +46,42 @@ module OKF
       # guard unless its Host is allowlisted; loopback binds keep the SDK
       # defaults. Protection itself stays on either way.
       def app_for(server, bind:, allowed_hosts: allowed_hosts_for(bind))
-        options = { stateless: true, enable_json_response: true }
-        options[:allowed_hosts] = allowed_hosts if allowed_hosts
+        options = { stateless: true, enable_json_response: true, max_request_bytes: MAX_REQUEST_BYTES }
+        options[:allowed_hosts] = allowed_hosts if allowed_hosts && !allowed_hosts.empty?
         app = ::MCP::Server::Transports::StreamableHTTPTransport.new(server, **options)
         server.transport = app
         app
       end
 
-      # The Host allowlist a bind address needs: nil for loopback (the SDK
-      # already admits it), [ bind ] otherwise — each entry matches the bare
-      # host on any port or a full host:port.
-      def allowed_hosts_for(bind)
-        return nil if LOOPBACK_HOSTS.include?(bind)
+      # The Host allowlist a bind address needs: nil for loopback, which the
+      # SDK already admits.
+      #
+      # A **wildcard** bind is the case that was broken. `--bind 0.0.0.0` says
+      # "serve every interface", and allowlisting the literal string "0.0.0.0"
+      # allowlists a Host header no client ever sends: the server bound
+      # everything and answered every real request with 403. What a client
+      # actually sends is the address it dialled, so a wildcard expands to this
+      # machine's own addresses plus its hostname.
+      #
+      # +extra+ (the repeatable --allow-host) covers what cannot be derived: a
+      # DNS name or a reverse proxy's Host, which no local interface knows.
+      def allowed_hosts_for(bind, extra: [])
+        extra = Array(extra).reject { |host| OKF.blank?(host) }
+        return (extra.empty? ? nil : extra) if LOOPBACK_HOSTS.include?(bind)
 
-        [ bind ]
+        hosts = WILDCARD_BINDS.include?(bind.to_s) ? local_hosts : [ bind ]
+        (hosts + extra).uniq
+      end
+
+      # Every address this machine answers on, plus its hostname. Loopback is
+      # left out only because the SDK admits it already.
+      def local_hosts
+        addresses = Socket.ip_address_list.reject(&:ipv4_loopback?).reject(&:ipv6_loopback?)
+        names = addresses.map(&:ip_address)
+        names << Socket.gethostname.to_s
+        names.reject { |name| OKF.blank?(name) }.uniq
+      rescue SocketError, SystemCallError
+        []
       end
 
       # Returns an unstarted server so tests can drive an ephemeral port.
@@ -66,17 +97,58 @@ module OKF
       end
 
       def handle(app, request, response)
-        status, headers, body = app.call(env_for(request))
+        # The cap is enforced *here*, before the body is materialized. The SDK
+        # transport has its own `max_request_bytes` and never reads more than
+        # that off `rack.input` — but WEBrick's `request.body` has no limit, so
+        # handing the transport a StringIO of it meant the allocation the cap
+        # exists to prevent had already happened. A few concurrent 2 GB POSTs
+        # would OOM the warm shared process that `--http` exists to provide.
+        body = read_body(request)
+        return oversized(response) if body.nil?
+
+        status, headers, out = app.call(env_for(request, body))
         response.status = status
         headers.each { |name, value| response[name] = value }
         buffer = String.new
-        body.each { |chunk| buffer << chunk }
+        out.each { |chunk| buffer << chunk }
         response.body = buffer
       ensure
-        body.close if body.respond_to?(:close)
+        out.close if out.respond_to?(:close)
       end
 
-      def env_for(request)
+      # The request body, or nil when it exceeds MAX_REQUEST_BYTES. A declared
+      # Content-Length past the cap is refused without reading a byte; an
+      # undeclared (chunked) body is streamed and abandoned the moment it grows
+      # past it.
+      def read_body(request)
+        # The raw header, not WEBrick's #content_length: that helper is
+        # `Integer(self["content-length"])`, which raises TypeError on a
+        # chunked request that legitimately carries no Content-Length at all.
+        declared = request["content-length"]
+        return nil if declared && declared.to_i > MAX_REQUEST_BYTES
+
+        # Always the block form: `request.body` with no block materializes the
+        # whole entity body, which for an undeclared (chunked) request is the
+        # very allocation this method exists to bound. With a block WEBrick
+        # streams, and a request carrying no body simply never yields.
+        buffer = String.new
+        request.body do |chunk|
+          buffer << chunk
+          return nil if buffer.bytesize > MAX_REQUEST_BYTES
+        end
+        buffer
+      end
+
+      def oversized(response)
+        response.status = 413
+        response["Content-Type"] = "application/json"
+        response.body = JSON.generate(
+          jsonrpc: "2.0", id: nil,
+          error: { code: -32_600, message: "Request body exceeds #{MAX_REQUEST_BYTES} bytes" }
+        )
+      end
+
+      def env_for(request, body = request.body.to_s)
         env = {
           "REQUEST_METHOD" => request.request_method,
           "SCRIPT_NAME" => "",
@@ -85,7 +157,7 @@ module OKF
           "SERVER_NAME" => request.host.to_s,
           "SERVER_PORT" => request.port.to_s,
           "rack.url_scheme" => "http",
-          "rack.input" => StringIO.new(request.body.to_s),
+          "rack.input" => StringIO.new(body.to_s),
           "rack.errors" => $stderr
         }
         request.each do |name, value|
